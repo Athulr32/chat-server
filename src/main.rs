@@ -1,37 +1,44 @@
 use axum::{
     extract::{
         ws::{Message, WebSocket},
-        ConnectInfo, WebSocketUpgrade,
+        State, WebSocketUpgrade,
     },
     response::Response,
     routing::{get, post},
-    Extension, Json, Router,
+    Extension, Router,
 };
-use futures_util::{lock::Mutex, Sink, SinkExt, StreamExt, stream::SplitSink};
-use hmac::{Hmac, Mac};
-use jwt::SignWithKey;
-use redis::Commands;
-use sha2::Sha256;
-use std::time::{Duration, SystemTime};
-use std::{
-    collections::{BTreeMap, HashMap},
-    ops::{Deref, DerefMut},
-    sync::Arc,
-};
-use tokio::sync::broadcast;
-use tokio::time::error::Error;
-
+use futures_util::{lock::Mutex, stream::SplitSink, SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::{collections::HashMap, sync::Arc};
+use tokio::sync::broadcast;
 
+use chat_server::login::login;
 
-struct Sock{
-    socket:SplitSink<WebSocket,Message>
+use hmac::{Hmac, Mac};
+use jwt::VerifyWithKey;
+
+use sha2::Sha256;
+use std::collections::BTreeMap;
+
+use mongodb::{
+    bson::{doc, to_document, Document},
+    options::ClientOptions,
+    Client, Database,
+};
+
+struct Sock {
+    socket: SplitSink<WebSocket, Message>,
 }
 
-
-#[derive(Serialize)]
-struct JWT {
-    key: String,
+//User message
+#[derive(Serialize, Deserialize, Clone)]
+struct UserMessage {
+    iv: Vec<u8>,
+    ephemPublicKey: Vec<u8>,
+    ciphertext: Vec<u8>,
+    mac: Vec<u8>,
+    public_key: Vec<u8>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -39,36 +46,47 @@ struct UserInfo {
     pk: String,
 }
 
-#[derive(Deserialize, Debug,Serialize)]
+#[derive(Deserialize, Debug, Serialize)]
 struct SocketAuth {
-    jwt: String,
+    token: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct UserMessageExtend {
+    user_message: UserMessage,
+    from: String,
 }
 
 async fn handler(
     ws: WebSocketUpgrade,
     Extension(state): Extension<Arc<Mutex<HashMap<String, broadcast::Sender<String>>>>>,
+    State(db): State<Database>,
 ) -> Response {
     //upgrade the websocket connection
     ws.on_failed_upgrade(|_| {})
-        .on_upgrade(move |socket| handle_socket(socket, state))
+        .on_upgrade(move |socket| handle_socket(socket, state, db))
 }
 
 async fn handle_socket(
     socket: WebSocket,
     state: Arc<Mutex<HashMap<String, broadcast::Sender<String>>>>,
+    db: Database,
 ) {
     let (mut sender, mut receiver) = socket.split();
 
     let (tx, mut rx) = broadcast::channel(100);
 
-
-    //Send message to other user
+    //Send message to user itself
     tokio::spawn(async move {
         while let Ok(msg) = rx.recv().await {
-            let _ = sender.send(Message::Text(msg)).await;
+            println!("{msg}");
+            let send_to_client = sender.send(Message::Text(msg)).await;
+
+            if send_to_client.is_err() {
+                break;
+            }
         }
     });
-
 
     //Wait for message from user
     tokio::spawn(async move {
@@ -76,6 +94,8 @@ async fn handle_socket(
         let mut pk = String::from("");
 
         while let Some(Ok(Message::Text(msg))) = receiver.next().await {
+            println!("{}", msg);
+
             if !auth {
                 let foo: Result<SocketAuth, serde_json::Error> = serde_json::from_str(&msg);
 
@@ -84,31 +104,68 @@ async fn handle_socket(
                     //If yes Add to authenticated pool
                     //Add the public key and channel
 
+                    let token = auth_details.token.to_string();
 
-                    pk = auth_details.jwt.to_string();
+                    let key: Hmac<Sha256> = Hmac::new_from_slice(b"wtsefhkjvsfvshkn").unwrap();
 
-                    let client = redis::Client::open("redis://127.0.0.1/").unwrap();
-                    let mut con = client.get_connection().unwrap();
-                  A
-                    let ser = serde_json::to_string(&auth_details).unwrap();
+                    let claims: Result<BTreeMap<String, String>, jwt::Error> =
+                        token.verify_with_key(&key);
 
-    
+                    if let Ok(claim) = claims {
+                        pk = claim["key"].to_string();
+                        let mut muttex = state.lock().await;
+                        muttex.insert(pk.to_string(), tx.clone());
 
-             
+                        auth = true;
 
-                    let mut muttex = state.lock().await;
-                    muttex.insert(auth_details.jwt, tx.clone());
-                    auth = true;
+                        tx.send("Authenticated".to_string()).unwrap();
+                    } else {
+                        tx.send("Invalid Key".to_string()).unwrap();
+                    }
                 } else {
                     tx.send("Invalid".to_string()).unwrap();
                 }
             } else {
+                //User message
+                let get_msg: Result<UserMessage, serde_json::Error> = serde_json::from_str(&msg);
+
+                if let Err(e) = get_msg {
+                    tx.send("Error in decoding".to_string()).unwrap();
+                    break;
+                }
+                let user_message = get_msg.unwrap();
+
+                let rec_pubkey = hex::encode(&user_message.clone().public_key);
+
                 let foo = state.lock().await;
-                println!("{:?}", foo);
 
-                let tr = foo.get(msg.trim()).unwrap();
+                let tr = foo.get(&rec_pubkey);
 
-                let _ = tr.send("You got it".to_string()).unwrap();
+                let user_message_extended = UserMessageExtend {
+                    from: pk.clone(),
+                    user_message,
+                };
+
+                if let None = tr {
+                    
+                    //Add to database
+                    let message_collection = db.collection::<Document>("messages");
+                    let docs = to_document(&user_message_extended).unwrap();
+                    message_collection.insert_one(docs, None).await.unwrap();
+
+                    println!("{}",serde_json::to_string(&user_message_extended).unwrap());
+
+                    tx.send("User offline".to_string()).unwrap();
+                } else if let Some(tr) = tr {
+                    //Send message to user
+                    let send_message = tr.send(serde_json::to_string(&user_message_extended).unwrap());
+
+                    if let Err(e) = send_message {
+                        let _ = tx.send("Error in sending try again".to_string());
+                    } else {
+                        tx.send("Message sent".to_string()).unwrap();
+                    }
+                }
             }
         }
 
@@ -120,47 +177,44 @@ async fn handle_socket(
     });
 }
 
-async fn get_token(Json(data): Json<UserInfo>) -> Json<JWT> {
-
-    let system_time = SystemTime::now();
-
-    println!("{:?}", system_time);
-    let key: Hmac<Sha256> = Hmac::new_from_slice(b"wtsefhkjvsfvshkn").unwrap();
-    let mut claims = BTreeMap::new();
-    claims.insert("sub", "someone");
-
-    let token_str = claims.sign_with_key(&key).unwrap();
-
-    Json(JWT { key: token_str })
+struct DBMessage {
+    messages: Vec<UserMessage>,
 }
 
-// impl Deref for Details {
-//     type Target = HashMap<String, broadcast::Sender<String>>;
-
-//     fn deref(&self) -> &Self::Target {
-//         &self.0
-//     }
-// }
-
-// impl DerefMut for Details {
-//     fn deref_mut(&mut self) -> &mut Self::Target {
-//         &mut self.0
-//     }
-// }
+async fn get_message() {}
 
 #[tokio::main]
 async fn main() {
     let state: Arc<Mutex<HashMap<String, broadcast::Sender<String>>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
+    let mut client_options = ClientOptions::parse("mongodb://localhost:27017")
+        .await
+        .unwrap();
+
+    let client = Client::with_options(client_options).unwrap();
+
+    // for db_name in client.list_database_names(None,None).await.unwrap(){
+    //     println!("{}",db_name);
+    // }
+
+    let db = client.database("ism");
+
+    //Collection
+    let user_collection = db.collection::<Document>("users");
+    let message_collection = db.collection::<Document>("messages");
+
+    let docs = doc! {"public_key":"wedjcn","name":"Athul","rfsd":"rfsd"};
+
+    user_collection.insert_one(docs, None).await.unwrap();
+
     let app = Router::new()
         .route("/ws", get(handler))
-        .route("/token", post(get_token))
-        // .route("/check1", get(sample1))
-        // .route("/check2", get(sample2))
-        .layer(Extension(state));
+        .route("/login", post(login))
+        .layer(Extension(state))
+        .with_state(db);
 
-    axum::Server::bind(&"127.0.0.1:3010".parse().unwrap())
+    axum::Server::bind(&"127.0.0.1:3011".parse().unwrap())
         .serve(app.into_make_service())
         .await
         .unwrap();
