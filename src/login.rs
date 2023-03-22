@@ -46,7 +46,7 @@ pub async fn get_token(pub_key: &str) -> Json<JWT> {
 
 #[axum_macros::debug_handler]
 //User login handler
-pub async fn login(Json(data): Json<LoginData>) -> Result<Json<JWT>, MyError> {
+pub async fn login(Json(data): Json<LoginData>) -> Result<Json<JWT>, Error> {
     //Get digital Signature from user and verify
     //If correct issue token containing the public key and time
     print!("{:?}", data.pub_key);
@@ -76,7 +76,7 @@ pub async fn login(Json(data): Json<LoginData>) -> Result<Json<JWT>, MyError> {
         Ok(get_token(&hex::encode(&data.pub_key)).await)
     } else {
         println!("Incorrect");
-        Err(MyError::SomethingElseWentWrong)
+        Err(Error::SomethingElseWentWrong)
     }
 
     // if data.public_key.len() != 2{
@@ -125,19 +125,19 @@ pub async fn login(Json(data): Json<LoginData>) -> Result<Json<JWT>, MyError> {
     //     .unwrap().to_owned();
 }
 
-pub enum MyError {
-    SomethingWentWrong,
+pub enum Error {
+    AuthenticationError,
     SomethingElseWentWrong,
 }
 
-impl IntoResponse for MyError {
+impl IntoResponse for Error {
     fn into_response(self) -> Response {
         let body = match self {
-            MyError::SomethingWentWrong => "something went wrong",
-            MyError::SomethingElseWentWrong => "something else went wrong",
+            Error::AuthenticationError => "Wrong credentials",
+            Error::SomethingElseWentWrong => "something else went wrong",
         };
 
         // its often easiest to implement `IntoResponse` by calling other implementations
-        (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
+        (StatusCode::BAD_REQUEST, body).into_response()
     }
 }
