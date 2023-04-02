@@ -2,6 +2,8 @@ import { View, Text } from "react-native";
 import { createNativeStackNavigator } from "@react-navigation/native-stack";
 import { NavigationContainer } from "@react-navigation/native";
 import ChatScreen from "../screens/ChatScreen";
+import Getin from "../screens/Getin";
+import CreateWallet from "../screens/CreateWallet";
 import ChatsScreens from "../screens/ChatsScreens";
 import { useState, useEffect } from "react";
 import AsyncStorage from "@react-native-async-storage/async-storage";
@@ -37,9 +39,18 @@ const index = () => {
           />
         )}
         <Stack.Screen
+          name='Getin'
+          component={Getin}
+          options={{ headerShown: false }}
+        />
+        <Stack.Screen
           name='Home'
           component={MainTabNavigator}
           options={{ headerShown: false }}
+        />
+        <Stack.Screen
+          name='CreateWallet'
+          component={CreateWallet}
         />
         <Stack.Screen name='Chat' component={ChatScreen} />
       </Stack.Navigator>

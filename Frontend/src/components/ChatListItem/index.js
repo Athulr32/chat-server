@@ -2,9 +2,17 @@ import { Text, View, Image, StyleSheet, Pressable } from "react-native";
 import dayjs from "dayjs";
 import { useNavigation } from "@react-navigation/native";
 import relativeTime from "dayjs/plugin/relativeTime";
+import { useEffect, useState } from "react";
 dayjs.extend(relativeTime);
 
-const ChatListItem = ({ chat }) => {
+const ChatListItem = ({ chat,timer }) => {
+
+  // useEffect(() => {
+  //   console.log(timer)
+  // }, [timer])
+  
+
+
 
 const navigation=useNavigation();
 
